@@ -13,10 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Install downloader
+      - name: Install FFmpeg and downloader
         shell: bash
         run: |
           set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
           python -m pip install --upgrade "yt-dlp[default]" curl-cffi
           ffmpeg -version | head -n 1
 
