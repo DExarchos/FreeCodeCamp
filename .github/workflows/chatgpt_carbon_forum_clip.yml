@@ -13,30 +13,210 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Install FFmpeg and downloader
+      - name: Install tools
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
-          python -m pip install --upgrade "yt-dlp[default]" curl-cffi
+          python -m pip install --upgrade "yt-dlp[default]" curl-cffi requests
           ffmpeg -version | head -n 1
 
-      - name: Download requested section
+      - name: Create requested clip
         shell: bash
         run: |
           set -euo pipefail
           rm -f carbon_forum_clip.*
-          yt-dlp \
-            --no-playlist \
-            --js-runtimes node \
-            --remote-components ejs:github \
-            --download-sections "*03:31:34-03:40:34" \
-            --force-keyframes-at-cuts \
-            --merge-output-format mp4 \
-            -f "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]" \
-            "https://www.youtube.com/watch?v=rEJgDeycSWw" \
-            -o "carbon_forum_clip.%(ext)s"
+          URL="https://www.youtube.com/watch?v=rEJgDeycSWw"
+
+          # First try several account-free YouTube clients. Cloud IP blocks vary by client.
+          for ARGS in \
+            "youtube:player_client=web_embedded" \
+            "youtube:player_client=web_embedded;player_skip=webpage,configs" \
+            "youtube:player_client=android_vr;player_skip=webpage,configs" \
+            "youtube:player_client=tv;player_skip=webpage,configs" \
+            "youtube:player_client=web_safari;player_skip=webpage,configs"; do
+            echo "Trying yt-dlp extractor args: $ARGS"
+            rm -f carbon_forum_clip.*
+            if yt-dlp \
+              --no-playlist \
+              --impersonate chrome \
+              --js-runtimes node \
+              --remote-components ejs:github \
+              --extractor-args "$ARGS" \
+              --download-sections "*03:31:34-03:40:34" \
+              --force-keyframes-at-cuts \
+              --merge-output-format mp4 \
+              --recode-video mp4 \
+              -f "bv*[height<=720]+ba/b[height<=720]" \
+              "$URL" \
+              -o "carbon_forum_clip.%(ext)s"; then
+              if test -s carbon_forum_clip.mp4; then
+                break
+              fi
+            fi
+          done
+
+          # If YouTube rejects the runner IP, use a public Piped proxy instance.
+          if ! test -s carbon_forum_clip.mp4; then
+            python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+
+          import requests
+
+          VIDEO_ID = "rEJgDeycSWw"
+          START = 3 * 3600 + 31 * 60 + 34
+          DURATION = 9 * 60
+          OUT = Path("carbon_forum_clip.mp4")
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36"
+          INSTANCES = [
+              "https://pipedapi.kavin.rocks",
+              "https://pipedapi.leptons.xyz",
+              "https://pipedapi.nosebs.ru",
+              "https://pipedapi-libre.kavin.rocks",
+              "https://piped-api.privacy.com.de",
+              "https://pipedapi.adminforge.de",
+              "https://api.piped.yt",
+              "https://pipedapi.drgns.space",
+              "https://pipedapi.owo.si",
+              "https://pipedapi.ducks.party",
+              "https://piped-api.codespace.cz",
+              "https://pipedapi.reallyaweso.me",
+              "https://api.piped.private.coffee",
+              "https://pipedapi.darkness.services",
+              "https://pipedapi.orangenet.cc",
+          ]
+
+          def stream_height(stream):
+              match = re.search(r"(\d{3,4})", str(stream.get("quality", "")))
+              return int(match.group(1)) if match else 0
+
+          def bitrate(stream):
+              try:
+                  return int(stream.get("bitrate") or 0)
+              except (TypeError, ValueError):
+                  return 0
+
+          def run_ffmpeg(args, label):
+              if OUT.exists():
+                  OUT.unlink()
+              cmd = [
+                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                  "-rw_timeout", "30000000",
+                  "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+              ] + args + [
+                  "-t", str(DURATION),
+                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+                  "-c:a", "aac", "-b:a", "128k",
+                  "-movflags", "+faststart", "-shortest", str(OUT),
+              ]
+              print(f"Running FFmpeg via {label}", flush=True)
+              try:
+                  subprocess.run(cmd, check=True, timeout=900)
+              except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                  print(f"FFmpeg failed via {label}: {exc}", flush=True)
+                  if OUT.exists():
+                      OUT.unlink()
+                  return False
+              return OUT.exists() and OUT.stat().st_size > 100_000
+
+          session = requests.Session()
+          session.headers.update({"User-Agent": UA, "Accept": "application/json"})
+
+          for base in INSTANCES:
+              print(f"Trying Piped instance: {base}", flush=True)
+              try:
+                  response = session.get(f"{base}/streams/{VIDEO_ID}", timeout=20)
+                  print(f"  HTTP {response.status_code}, {len(response.content)} bytes", flush=True)
+                  response.raise_for_status()
+                  data = response.json()
+              except Exception as exc:
+                  print(f"  API failed: {exc}", flush=True)
+                  continue
+
+              if data.get("error"):
+                  print(f"  API error: {data.get('error')}", flush=True)
+                  continue
+
+              videos = [s for s in (data.get("videoStreams") or []) if s.get("url")]
+              audios = [s for s in (data.get("audioStreams") or []) if s.get("url")]
+
+              video_only = [s for s in videos if s.get("videoOnly") is True]
+              video_only.sort(
+                  key=lambda s: (
+                      stream_height(s) <= 720,
+                      stream_height(s),
+                      "mp4" in str(s.get("mimeType", "")).lower(),
+                      bitrate(s),
+                  ),
+                  reverse=True,
+              )
+              audio_only = audios[:]
+              audio_only.sort(
+                  key=lambda s: (
+                      "mp4" in str(s.get("mimeType", "")).lower() or str(s.get("format", "")).upper() == "M4A",
+                      bitrate(s),
+                  ),
+                  reverse=True,
+              )
+
+              if video_only and audio_only:
+                  video = next((s for s in video_only if 0 < stream_height(s) <= 720), video_only[0])
+                  audio = audio_only[0]
+                  print(
+                      f"  Selected separate streams: {video.get('quality')} {video.get('mimeType')} + "
+                      f"{audio.get('format')} {bitrate(audio)} bps",
+                      flush=True,
+                  )
+                  args = [
+                      "-ss", str(START), "-user_agent", UA, "-i", video["url"],
+                      "-ss", str(START), "-user_agent", UA, "-i", audio["url"],
+                      "-map", "0:v:0", "-map", "1:a:0",
+                  ]
+                  if run_ffmpeg(args, f"{base} separate streams"):
+                      sys.exit(0)
+
+              muxed = [s for s in videos if s.get("videoOnly") is not True]
+              muxed.sort(
+                  key=lambda s: (
+                      stream_height(s) <= 720,
+                      stream_height(s),
+                      "mp4" in str(s.get("mimeType", "")).lower(),
+                      bitrate(s),
+                  ),
+                  reverse=True,
+              )
+              if muxed:
+                  stream = next((s for s in muxed if 0 < stream_height(s) <= 720), muxed[0])
+                  print(f"  Selected muxed stream: {stream.get('quality')} {stream.get('mimeType')}", flush=True)
+                  args = [
+                      "-ss", str(START), "-user_agent", UA, "-i", stream["url"],
+                      "-map", "0:v:0", "-map", "0:a:0?",
+                  ]
+                  if run_ffmpeg(args, f"{base} muxed stream"):
+                      sys.exit(0)
+
+              for manifest_name in ("hls", "dash"):
+                  manifest = data.get(manifest_name)
+                  if manifest:
+                      print(f"  Trying {manifest_name.upper()} manifest", flush=True)
+                      args = [
+                          "-ss", str(START), "-user_agent", UA, "-i", manifest,
+                          "-map", "0:v:0", "-map", "0:a:0?",
+                      ]
+                      if run_ffmpeg(args, f"{base} {manifest_name}"):
+                          sys.exit(0)
+
+          raise SystemExit("All account-free YouTube and Piped routes failed")
+          PY
+          fi
+
           test -s carbon_forum_clip.mp4
           ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 carbon_forum_clip.mp4
 
