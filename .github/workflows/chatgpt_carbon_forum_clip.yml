@@ -19,206 +19,209 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
-          python -m pip install --upgrade "yt-dlp[default]" curl-cffi requests
+          python -m pip install --upgrade curl-cffi requests
           ffmpeg -version | head -n 1
 
-      - name: Create requested clip
+      - name: Create requested clip through embed proxies
         shell: bash
         run: |
           set -euo pipefail
           rm -f carbon_forum_clip.*
-          URL="https://www.youtube.com/watch?v=rEJgDeycSWw"
-
-          # First try several account-free YouTube clients. Cloud IP blocks vary by client.
-          for ARGS in \
-            "youtube:player_client=web_embedded" \
-            "youtube:player_client=web_embedded;player_skip=webpage,configs" \
-            "youtube:player_client=android_vr;player_skip=webpage,configs" \
-            "youtube:player_client=tv;player_skip=webpage,configs" \
-            "youtube:player_client=web_safari;player_skip=webpage,configs"; do
-            echo "Trying yt-dlp extractor args: $ARGS"
-            rm -f carbon_forum_clip.*
-            if yt-dlp \
-              --no-playlist \
-              --impersonate chrome \
-              --js-runtimes node \
-              --remote-components ejs:github \
-              --extractor-args "$ARGS" \
-              --download-sections "*03:31:34-03:40:34" \
-              --force-keyframes-at-cuts \
-              --merge-output-format mp4 \
-              --recode-video mp4 \
-              -f "bv*[height<=720]+ba/b[height<=720]" \
-              "$URL" \
-              -o "carbon_forum_clip.%(ext)s"; then
-              if test -s carbon_forum_clip.mp4; then
-                break
-              fi
-            fi
-          done
-
-          # If YouTube rejects the runner IP, use a public Piped proxy instance.
-          if ! test -s carbon_forum_clip.mp4; then
-            python - <<'PY'
+          python - <<'PY'
+          import html
           import json
-          import os
           import re
           import subprocess
           import sys
-          import time
           from pathlib import Path
+          from urllib.parse import urljoin
 
-          import requests
+          from curl_cffi import requests
 
           VIDEO_ID = "rEJgDeycSWw"
           START = 3 * 3600 + 31 * 60 + 34
           DURATION = 9 * 60
           OUT = Path("carbon_forum_clip.mp4")
-          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36"
-          INSTANCES = [
-              "https://pipedapi.kavin.rocks",
-              "https://pipedapi.leptons.xyz",
-              "https://pipedapi.nosebs.ru",
-              "https://pipedapi-libre.kavin.rocks",
-              "https://piped-api.privacy.com.de",
-              "https://pipedapi.adminforge.de",
-              "https://api.piped.yt",
-              "https://pipedapi.drgns.space",
-              "https://pipedapi.owo.si",
-              "https://pipedapi.ducks.party",
-              "https://piped-api.codespace.cz",
-              "https://pipedapi.reallyaweso.me",
-              "https://api.piped.private.coffee",
-              "https://pipedapi.darkness.services",
-              "https://pipedapi.orangenet.cc",
+          BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+          BOT_UAS = [
+              "Discordbot/2.0",
+              "TelegramBot (like TwitterBot)",
+              "facebookexternalhit/1.1",
+              "Twitterbot/1.0",
           ]
 
-          def stream_height(stream):
-              match = re.search(r"(\d{3,4})", str(stream.get("quality", "")))
-              return int(match.group(1)) if match else 0
+          session = requests.Session(impersonate="chrome")
+          candidates = []
+          seen = set()
 
-          def bitrate(stream):
+          def add_candidate(url, label, headers=None):
+              if not url:
+                  return
+              url = html.unescape(str(url)).replace("&amp;", "&").strip()
+              if url.startswith("//"):
+                  url = "https:" + url
+              if not url.startswith(("http://", "https://")):
+                  return
+              key = (url, label)
+              if key in seen:
+                  return
+              seen.add(key)
+              candidates.append((url, label, headers or {}))
+              print(f"Candidate from {label}: {url[:240]}", flush=True)
+
+          def request_no_follow(url, label, ua=BROWSER_UA):
               try:
-                  return int(stream.get("bitrate") or 0)
-              except (TypeError, ValueError):
-                  return 0
+                  response = session.get(
+                      url,
+                      headers={"User-Agent": ua, "Accept": "*/*"},
+                      allow_redirects=False,
+                      timeout=30,
+                  )
+                  print(
+                      f"{label}: HTTP {response.status_code}; type={response.headers.get('content-type')}; "
+                      f"location={str(response.headers.get('location'))[:180]}",
+                      flush=True,
+                  )
+                  if response.headers.get("location"):
+                      add_candidate(urljoin(url, response.headers["location"]), label + " redirect", {"Referer": url})
+                  return response
+              except Exception as exc:
+                  print(f"{label} request failed: {exc}", flush=True)
+                  return None
 
-          def run_ffmpeg(args, label):
+          # Koutube has a documented direct mode backed by its private Invidious service.
+          koutube_direct_urls = [
+              f"https://koutube.com/watch?v={VIDEO_ID}&direct&itag=18&nocache",
+              f"https://koutube.com/api/watch?v={VIDEO_ID}&direct&itag=18&nocache",
+              f"https://koutu.be/{VIDEO_ID}?direct&itag=18&nocache",
+              f"https://koutu.be/api/{VIDEO_ID}?direct&itag=18&nocache",
+          ]
+          for index, url in enumerate(koutube_direct_urls, 1):
+              request_no_follow(url, f"Koutube direct {index}")
+
+          # The JSON endpoint can expose the same stream as playerStreamUrl.
+          for url in [
+              f"https://koutube.com/api/watch?v={VIDEO_ID}&itag=18&nocache",
+              f"https://koutu.be/api/{VIDEO_ID}?itag=18&nocache",
+          ]:
+              try:
+                  response = session.get(url, headers={"User-Agent": BROWSER_UA, "Accept": "application/json"}, timeout=40)
+                  print(f"Koutube API: HTTP {response.status_code}; {len(response.content)} bytes", flush=True)
+                  data = response.json()
+                  print(f"Koutube API error field: {data.get('error')}", flush=True)
+                  add_candidate(data.get("playerStreamUrl"), "Koutube API", {"Referer": url})
+              except Exception as exc:
+                  print(f"Koutube API failed: {exc}", flush=True)
+
+          # Bot-oriented embed services often publish the raw playable URL in OpenGraph metadata.
+          embed_pages = [
+              f"https://www.yfxtube.com/watch?v={VIDEO_ID}",
+              f"https://fxyoutu.be/{VIDEO_ID}",
+              f"https://koutube.com/watch?v={VIDEO_ID}&itag=18&nocache",
+              f"https://koutu.be/{VIDEO_ID}?itag=18&nocache",
+          ]
+          meta_patterns = [
+              r'<meta[^>]+(?:property|name)=["\'](?:og:video(?::url)?|twitter:player:stream)["\'][^>]+content=["\']([^"\']+)',
+              r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:video(?::url)?|twitter:player:stream)["\']',
+              r'"playerStreamUrl"\s*:\s*"([^"]+)"',
+          ]
+          for page in embed_pages:
+              for ua in BOT_UAS:
+                  try:
+                      response = session.get(page, headers={"User-Agent": ua, "Accept": "text/html,*/*"}, allow_redirects=False, timeout=30)
+                      print(f"Embed page {page} as {ua}: HTTP {response.status_code}; {len(response.content)} bytes", flush=True)
+                      if response.headers.get("location"):
+                          location = urljoin(page, response.headers["location"])
+                          if "youtube.com" not in location and "youtu.be" not in location:
+                              add_candidate(location, "embed redirect", {"Referer": page})
+                      text = response.text
+                      for pattern in meta_patterns:
+                          for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                              add_candidate(urljoin(page, match), f"embed metadata {ua}", {"Referer": page})
+                  except Exception as exc:
+                      print(f"Embed request failed for {page}: {exc}", flush=True)
+
+          def validate_output():
+              if not OUT.exists() or OUT.stat().st_size < 500_000:
+                  return False
+              try:
+                  probe = subprocess.check_output(
+                      [
+                          "ffprobe", "-v", "error", "-show_entries", "format=duration,size",
+                          "-show_entries", "stream=codec_type", "-of", "json", str(OUT),
+                      ],
+                      text=True,
+                      timeout=30,
+                  )
+                  info = json.loads(probe)
+                  duration = float(info.get("format", {}).get("duration", 0))
+                  types = {stream.get("codec_type") for stream in info.get("streams", [])}
+                  print(f"Output probe: duration={duration:.3f}s, streams={sorted(types)}, size={OUT.stat().st_size}", flush=True)
+                  return duration >= 535 and {"video", "audio"}.issubset(types)
+              except Exception as exc:
+                  print(f"Output validation failed: {exc}", flush=True)
+                  return False
+
+          def try_candidate(url, label, extra_headers):
               if OUT.exists():
                   OUT.unlink()
+
+              # Fast reachability check, following redirects without reading the body.
+              try:
+                  headers = {"User-Agent": BROWSER_UA, "Range": "bytes=0-1023", **extra_headers}
+                  check = session.get(url, headers=headers, allow_redirects=True, stream=True, timeout=35)
+                  print(
+                      f"Check {label}: HTTP {check.status_code}; type={check.headers.get('content-type')}; "
+                      f"final={str(check.url)[:200]}",
+                      flush=True,
+                  )
+                  if check.status_code >= 400:
+                      check.close()
+                      return False
+                  final_url = str(check.url)
+                  check.close()
+              except Exception as exc:
+                  print(f"Reachability check failed for {label}: {exc}", flush=True)
+                  final_url = url
+
+              header_blob = "".join(f"{key}: {value}\r\n" for key, value in extra_headers.items())
               cmd = [
                   "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-                  "-rw_timeout", "30000000",
+                  "-rw_timeout", "45000000",
                   "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-              ] + args + [
+                  "-ss", str(START),
+                  "-user_agent", BROWSER_UA,
+              ]
+              if header_blob:
+                  cmd += ["-headers", header_blob]
+              cmd += [
+                  "-i", final_url,
                   "-t", str(DURATION),
-                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+                  "-map", "0:v:0", "-map", "0:a:0?",
+                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "25",
                   "-c:a", "aac", "-b:a", "128k",
                   "-movflags", "+faststart", "-shortest", str(OUT),
               ]
               print(f"Running FFmpeg via {label}", flush=True)
               try:
-                  subprocess.run(cmd, check=True, timeout=900)
+                  subprocess.run(cmd, check=True, timeout=1000)
               except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
                   print(f"FFmpeg failed via {label}: {exc}", flush=True)
                   if OUT.exists():
                       OUT.unlink()
                   return False
-              return OUT.exists() and OUT.stat().st_size > 100_000
+              return validate_output()
 
-          session = requests.Session()
-          session.headers.update({"User-Agent": UA, "Accept": "application/json"})
+          for url, label, headers in candidates:
+              if try_candidate(url, label, headers):
+                  print(f"SUCCESS through {label}", flush=True)
+                  sys.exit(0)
 
-          for base in INSTANCES:
-              print(f"Trying Piped instance: {base}", flush=True)
-              try:
-                  response = session.get(f"{base}/streams/{VIDEO_ID}", timeout=20)
-                  print(f"  HTTP {response.status_code}, {len(response.content)} bytes", flush=True)
-                  response.raise_for_status()
-                  data = response.json()
-              except Exception as exc:
-                  print(f"  API failed: {exc}", flush=True)
-                  continue
-
-              if data.get("error"):
-                  print(f"  API error: {data.get('error')}", flush=True)
-                  continue
-
-              videos = [s for s in (data.get("videoStreams") or []) if s.get("url")]
-              audios = [s for s in (data.get("audioStreams") or []) if s.get("url")]
-
-              video_only = [s for s in videos if s.get("videoOnly") is True]
-              video_only.sort(
-                  key=lambda s: (
-                      stream_height(s) <= 720,
-                      stream_height(s),
-                      "mp4" in str(s.get("mimeType", "")).lower(),
-                      bitrate(s),
-                  ),
-                  reverse=True,
-              )
-              audio_only = audios[:]
-              audio_only.sort(
-                  key=lambda s: (
-                      "mp4" in str(s.get("mimeType", "")).lower() or str(s.get("format", "")).upper() == "M4A",
-                      bitrate(s),
-                  ),
-                  reverse=True,
-              )
-
-              if video_only and audio_only:
-                  video = next((s for s in video_only if 0 < stream_height(s) <= 720), video_only[0])
-                  audio = audio_only[0]
-                  print(
-                      f"  Selected separate streams: {video.get('quality')} {video.get('mimeType')} + "
-                      f"{audio.get('format')} {bitrate(audio)} bps",
-                      flush=True,
-                  )
-                  args = [
-                      "-ss", str(START), "-user_agent", UA, "-i", video["url"],
-                      "-ss", str(START), "-user_agent", UA, "-i", audio["url"],
-                      "-map", "0:v:0", "-map", "1:a:0",
-                  ]
-                  if run_ffmpeg(args, f"{base} separate streams"):
-                      sys.exit(0)
-
-              muxed = [s for s in videos if s.get("videoOnly") is not True]
-              muxed.sort(
-                  key=lambda s: (
-                      stream_height(s) <= 720,
-                      stream_height(s),
-                      "mp4" in str(s.get("mimeType", "")).lower(),
-                      bitrate(s),
-                  ),
-                  reverse=True,
-              )
-              if muxed:
-                  stream = next((s for s in muxed if 0 < stream_height(s) <= 720), muxed[0])
-                  print(f"  Selected muxed stream: {stream.get('quality')} {stream.get('mimeType')}", flush=True)
-                  args = [
-                      "-ss", str(START), "-user_agent", UA, "-i", stream["url"],
-                      "-map", "0:v:0", "-map", "0:a:0?",
-                  ]
-                  if run_ffmpeg(args, f"{base} muxed stream"):
-                      sys.exit(0)
-
-              for manifest_name in ("hls", "dash"):
-                  manifest = data.get(manifest_name)
-                  if manifest:
-                      print(f"  Trying {manifest_name.upper()} manifest", flush=True)
-                      args = [
-                          "-ss", str(START), "-user_agent", UA, "-i", manifest,
-                          "-map", "0:v:0", "-map", "0:a:0?",
-                      ]
-                      if run_ffmpeg(args, f"{base} {manifest_name}"):
-                          sys.exit(0)
-
-          raise SystemExit("All account-free YouTube and Piped routes failed")
+          raise SystemExit("No embed-proxy route produced a valid audiovisual clip")
           PY
-          fi
 
           test -s carbon_forum_clip.mp4
-          ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 carbon_forum_clip.mp4
+          ffprobe -v error -show_entries format=duration,size -show_entries stream=codec_type -of default=noprint_wrappers=1 carbon_forum_clip.mp4
 
       - name: Upload MP4
         uses: actions/upload-artifact@v4
