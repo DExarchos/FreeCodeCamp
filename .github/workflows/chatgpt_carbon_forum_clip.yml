@@ -1,0 +1,48 @@
+name: Temporary carbon forum clip
+
+on:
+  push:
+    branches:
+      - greenkeeper-babel-eslint-6.1.1
+
+permissions:
+  contents: read
+
+jobs:
+  create-clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Install downloader
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade "yt-dlp[default]" curl-cffi
+          ffmpeg -version | head -n 1
+
+      - name: Download requested section
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f carbon_forum_clip.*
+          yt-dlp \
+            --no-playlist \
+            --js-runtimes node \
+            --remote-components ejs:github \
+            --download-sections "*03:31:34-03:40:34" \
+            --force-keyframes-at-cuts \
+            --merge-output-format mp4 \
+            -f "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]" \
+            "https://www.youtube.com/watch?v=rEJgDeycSWw" \
+            -o "carbon_forum_clip.%(ext)s"
+          test -s carbon_forum_clip.mp4
+          ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 carbon_forum_clip.mp4
+
+      - name: Upload MP4
+        uses: actions/upload-artifact@v4
+        with:
+          name: carbon_forum_clip
+          path: carbon_forum_clip.mp4
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
